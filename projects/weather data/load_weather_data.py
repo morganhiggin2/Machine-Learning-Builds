@@ -2,6 +2,7 @@ import pyarrow
 import pandas
 from scipy.stats import vonmises 
 import math
+import numpy
 
 def get_weather_dataset_pyarrow():
     dtype = {'date': 'string[pyarrow]', 'ind.0': 'bool[pyarrow]', 'rain': 'float32[pyarrow]', 'ind.1': 'bool[pyarrow]', 'temp': 'float32[pyarrow]', 'ind.2': 'bool[pyarrow]', 'wetb': 'float32[pyarrow]', 'dewpt': 'float32[pyarrow]', 'vappr': 'float32[pyarrow]', 'rhum': 'int8[pyarrow]', 'msl': 'float32[pyarrow]'}
@@ -48,14 +49,23 @@ def rainy_classification():
     # we want to know the probability of it raining based on a. the time of year and b. the temperature outside (although the two are somewhat correlted, we will use both to be comprehensive)
     #dataset['given_year_delta'].astype('int64[pyarrow]')
     given_year_delta_seconds = dataset['given_year_delta'].astype('int64[pyarrow]')
-    temp_rounded_int = dataset['temp'].floor().astype('int64[pyarrow]')
+    temp_rounded_int = dataset['temp'].apply(pyarrow.compute.floor).astype('int64[pyarrow]')
 
     #vectorize as numpy
-    X = pandas.Dataset(data=[given_year_dalta_seconds, temp_rounded_int], columns=['given_year_delta_seconds', 'temp_rounded_int'])
+    X = pandas.DataFrame(data={'given_year_delta_seconds': given_year_delta_seconds, 'temp_rounded_int': temp_rounded_int})
 
-    x = X.to_numpy()
-    y = dataset['percipitation_classifier'].to_numpy()
+    x = X.to_numpy(dtype=numpy.dtype([('given_year_delta_seconds', 'i'), ('temp_rounded_int', 'i')]))
+    print(x.dtype)
+    print(x)
+    exit()
+    # rainy, clear
+    # False, True
+    # ...
+    #y = pandas.DataFrame(data=[dataset['percipitation_classifier'], ~dataset['percipitation_classifier']], columns=['rainy', 'clear']).to_numpy()
+    y = pandas.DataFrame(data={'rainy': dataset['percipitation_classifier'], 'clear': ~dataset['percipitation_classifier']}, dtype='bool[pyarrow]')
 
+
+    y = y.to_numpy(dtype={})
     clf = RidgeClassifier(max_iter=100, class_weight=classification_weights, solver='svd').fit(x, y)
 
 
