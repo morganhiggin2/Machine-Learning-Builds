@@ -1,1 +1,0 @@
-use deep learning, as well as some machine learning techiques, compare their affectivness

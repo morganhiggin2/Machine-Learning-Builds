@@ -1,3 +1,0 @@
-sudo apt install nvidia-cuda-toolkit
-sudo ubuntu-drivers autoinstall
-sudo reboot

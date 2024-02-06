@@ -1,5 +1,0 @@
-idea 1: double pendulum time simulation based on (l1, l2, theta1, theta2, time), from 90* starting position, ask it to predict positions at time. run simulation.
-
-idea 2: predict housing rent trends (or get probability of) with mixture gaussian distribution (idea is there are different rent classes, and each have a different distribution).
-- sub idea: classify housing rent trends with various classification algorithms
-
