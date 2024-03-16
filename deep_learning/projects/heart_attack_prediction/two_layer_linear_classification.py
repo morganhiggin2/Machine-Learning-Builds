@@ -77,11 +77,11 @@ sample_loss = loss_function(model(training_sample_inputs), training_sample_targe
 # Compute Loss over test data
 avg_loss = 0
 
-for inputs, targets in training_data_loader:
+for inputs, targets in test_data_loader:
     avg_loss = avg_loss + loss_function(model(inputs), targets)
 
-avg_loss = avg_loss / len(training_data)
+avg_loss = avg_loss / len(test_data)
 
 print(f"sample loss was {sample_loss}")
-print(f"traning data loss was {avg_loss}")
+print(f"test data loss was {avg_loss}")
 print(str(loss_function.weight))
