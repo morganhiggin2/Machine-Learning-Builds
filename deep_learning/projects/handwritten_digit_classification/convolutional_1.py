@@ -25,19 +25,22 @@ class HandwritingDataset(Dataset):
 
         #Becuase the dataset is small enough to keep in memory, we will load it at once and just pull it
         #this will be a list of tensors
-        image_csv = pandas.read_csv(image_csv_file, index_col=False)
+        image_csv = pandas.read_csv(image_csv_file, index_col=False, dtype=numpy.float32)
 
         self.images = []
         self.labels = []
         for i, row in image_csv.iterrows():
             if sub_dir == "train":
                 image = torch.from_numpy(row.iloc[1:785].to_numpy())
-                digit_class = torch.nn.functional.one_hot(torch.tensor(row['label']), num_classes=10)
+                digit_class = torch.nn.functional.one_hot(torch.tensor(row['label'].astype(dtype=numpy.int64)), num_classes=10)
+                digit_class = digit_class.float()
             else:
                 image = torch.from_numpy(row.iloc[0:784].to_numpy())
-                digit_class = torch.zeros(10) 
+                digit_class = torch.zeros(10, dtype=torch.float32) 
 
             image = image.reshape(shape=(28, 28))
+            #TODO check if this is messing up our convergence at larger batch sizes
+            image = image.unsqueeze(0)
 
             if self.use_gpu:
                 if torch.cuda.device_count() >= 1:
@@ -57,7 +60,7 @@ class HandwrittenClassifier(torch.nn.Module):
     def __init__(self, use_gpu=False):
         super().__init__()
 
-        image_dimensions = (416, 416)
+        image_dimensions = (28, 28) 
 
         '''
         conv_1 = torch.nn.Conv2d(in_channels=3, out_channels=6, kernel_size=11, stride=7, padding=2)
@@ -73,14 +76,15 @@ class HandwrittenClassifier(torch.nn.Module):
         relu_4 = torch.nn.ReLU()
         '''
  
-        conv_1 = torch.nn.Conv2d(in_channels=1, out_channels=1, kernel_size=5, stride=1, padding='same')
+        conv_1 = torch.nn.Conv2d(in_channels=1, out_channels=10, kernel_size=5, stride=1, padding='same')
         relu_1 = torch.nn.ReLU()
         max_pool_1 = torch.nn.MaxPool2d(kernel_size=4, stride=4)
         relu_2 = torch.nn.ReLU()
         flatten_1 = torch.nn.Flatten(1, 3)
-        linear_1 = torch.nn.Linear(in_features=49, out_features=10)
-        softmax_1 = torch.nn.Softmax()
-        self.net = torch.nn.Sequential(conv_1, relu_1, max_pool_1, relu_2, flatten_1, linear_1, softmax_1)
+        linear_1 = torch.nn.Linear(in_features=490, out_features=92)
+        relu_3 = torch.nn.ReLU()
+        linear_2 = torch.nn.Linear(in_features=92, out_features=10)
+        self.net = torch.nn.Sequential(conv_1, relu_1, max_pool_1, relu_2, flatten_1, linear_1, relu_3, linear_2)
 
         if use_gpu:
             if torch.cuda.device_count() >= 1:
@@ -92,8 +96,8 @@ class HandwrittenClassifier(torch.nn.Module):
 #Model Variables
 num_epochs = 4 
 learning_rate = 1.0e-3 
-training_data_batch_size = 40 
-use_gpu = False
+training_data_batch_size = 10 
+use_gpu = True 
 
 training_dataset = HandwritingDataset(use_gpu=True)
 test_dataset = HandwritingDataset(test=True, use_gpu=True)
@@ -108,7 +112,7 @@ optimizer = torch.optim.SGD(
     [{'params': model.parameters()}],
     lr=learning_rate
 )
-loss_function = torch.nn.CrossEntropyLoss()
+loss_function = torch.nn.CrossEntropyLoss(reduction='mean')
 
 #Dynamic Graph
 store_losses = []
@@ -121,9 +125,6 @@ for epoch in range(num_epochs):
 
     #Move forward
     for i, (inputs, targets) in enumerate(training_data_loader):
-        inputs = inputs.unsqueeze(0)
-        print(inputs.size())
-
         #Get predictions
         y_pred = model.forward(inputs)
 
@@ -151,7 +152,12 @@ sample_loss = loss_function(model(training_sample_inputs), training_sample_targe
 avg_loss = 0
 
 for i, (inputs, targets) in enumerate(test_data_loader):
+    print('predition was {pred} and target was {target}'.format(pred=model(inputs), target=targets))
     avg_loss = avg_loss + loss_function(model(inputs), targets).detach().item()
+
+    #TODO DELETE
+    if i == 1:
+        break
 
 avg_loss = avg_loss / len(test_dataset)
 
@@ -172,7 +178,6 @@ axis = figure.add_subplot(111)
 line, = axis.plot(graph_epochs, graph_losses, 'o')
 axis.set_xlabel('epoch')
 axis.set_ylabel('loss')
-
 
 pyplot.show()
 #watch -n 0.5 nvidia-smi
