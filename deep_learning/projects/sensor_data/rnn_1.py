@@ -51,14 +51,15 @@ class SensorDataset(Dataset):
 
     def __getitem__(self, ind):
         #Array of inputs, output
-        return [self.input_data[i, :] for i in range(ind, self.hidden_depth)], self.input_data[ind + self.hidden_depth, :]
-        #return self.input_data[ind: ind + self.hidden_depth], self.input_data[ind: ind + self.hidden_depth + 1]
+        #return ([self.input_data[i, :] for i in range(ind, self.hidden_depth)], self.input_data[ind + self.hidden_depth, :])
+        return self.input_data[ind: ind + self.hidden_depth, :], self.input_data[ind + self.hidden_depth, :]
 
 class TimeSeriesSensorPredictor(torch.nn.Module):
     def __init__(self, hidden_depth=1, use_gpu=False):
         super().__init__()
 
-        self.net = torch.nn.RNN(input_size=3, hidden_size=3, num_layers=1) 
+        self.num_hidden_features = 3
+        self.net = torch.nn.RNN(input_size=3, hidden_size=self.num_hidden_features, num_layers=1, batch_first=True, dtype=torch.float64) 
         self.hidden_depth = hidden_depth
 
         if use_gpu:
@@ -68,10 +69,13 @@ class TimeSeriesSensorPredictor(torch.nn.Module):
     def forward(self, X, H):
         return self.net(X, H)
 
+    def get_zero_hidden(self, num_batches):
+        return torch.zeros((1, num_batches, self.num_hidden_features), dtype=torch.float64)
+
 #Model Variables
 num_epochs = 4 
 learning_rate = 1.0e-3 
-training_data_batch_size = 1 
+training_data_batch_size = 2 
 hidden_depth = 4
 use_gpu = True 
 
@@ -81,8 +85,7 @@ training_data_length = math.floor(0.8 * len(dataset))
 training_dataset, test_dataset = random_split(dataset, [training_data_length, len(dataset) - training_data_length], generator=generator) 
 
 #Generate data loaders for data
-#training_data_loader = DataLoader(training_dataset, shuffle=True, batch_size=training_data_batch_size, num_workers=0)
-training_data_loader = DataLoader(training_dataset, shuffle=True, num_workers=0)
+training_data_loader = DataLoader(training_dataset, shuffle=True, batch_size=training_data_batch_size, num_workers=0)
 test_data_loader = DataLoader(test_dataset, shuffle=True, num_workers=0)
 
 #Components
@@ -105,10 +108,12 @@ for epoch in range(num_epochs):
     #Move forward
     for i, (inputs, target) in enumerate(training_data_loader):
         #Get predictions
-        print(inputs)
-        print(target)
-        for input in inputs:
-            y_pred, hidden = model.forward(input, hidden)
+        hidden = torch.clone(model.get_zero_hidden(training_data_batch_size)) 
+
+        y_pred, _hidden = model.forward(inputs, hidden)
+
+        #Get last output of each RNN iteration to use as predition
+        y_pred = y_pred[:, hidden_depth - 1, :]
 
         #Compute Loss
         #Only compute loss over final output, and not all outputs
@@ -129,14 +134,17 @@ progress_bar.finish()
 
 # Compute Loss over training data
 training_sample_inputs, training_sample_targets = next(iter(training_data_loader))
-sample_loss = loss_function(model(training_sample_inputs), training_sample_targets).detach().item()
+hidden = torch.clone(model.get_zero_hidden(training_data_batch_size)) 
+sample_loss = loss_function(model(training_sample_inputs, hidden)[0][:, hidden_depth - 1, :], training_sample_targets).detach().item()
 
 # Compute Loss over test data
 avg_loss = 1
 
 for i, (inputs, targets) in enumerate(test_data_loader):
-    print('predition was {pred} and target was {target}'.format(pred=model(inputs), target=targets))
-    avg_loss = avg_loss + loss_function(model(inputs), targets).detach().item()
+    hidden = torch.clone(model.get_zero_hidden(1)) 
+    prediction = model(inputs, hidden)[0][:, hidden_depth - 1, :]
+    print('predition was {pred} and target was {target}'.format(pred=prediction, target=targets))
+    avg_loss = avg_loss + loss_function(prediction, targets).detach().item()
 
     #TODO DELETE
     if i == 1:
