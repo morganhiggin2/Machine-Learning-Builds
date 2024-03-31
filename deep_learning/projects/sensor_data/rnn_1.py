@@ -41,6 +41,7 @@ class SensorDataset(Dataset):
         #prepare into time series data
         #just do tensor for now and use slices
         self.input_data = torch.from_numpy(numpy_data)
+        self.input_data.requires_grad = True
 
         if self.use_gpu:
             if torch.cuda.device_count() >= 1:
@@ -52,14 +53,14 @@ class SensorDataset(Dataset):
     def __getitem__(self, ind):
         #Array of inputs, output
         #return ([self.input_data[i, :] for i in range(ind, self.hidden_depth)], self.input_data[ind + self.hidden_depth, :])
-        return self.input_data[ind: ind + self.hidden_depth, :], self.input_data[ind + self.hidden_depth, :]
+        return self.input_data[ind: ind + self.hidden_depth, :], self.input_data[ind + self.hidden_depth, :].unsqueeze(0)
 
 class TimeSeriesSensorPredictor(torch.nn.Module):
     def __init__(self, hidden_depth=1, use_gpu=False):
         super().__init__()
 
         self.num_hidden_features = 3
-        self.net = torch.nn.RNN(input_size=3, hidden_size=self.num_hidden_features, num_layers=1, batch_first=True, dtype=torch.float64) 
+        self.net = torch.nn.RNN(input_size=3, hidden_size=self.num_hidden_features, num_layers=1, batch_first=True, dtype=torch.float64, nonlinearity='relu') 
         self.hidden_depth = hidden_depth
 
         if use_gpu:
@@ -73,10 +74,10 @@ class TimeSeriesSensorPredictor(torch.nn.Module):
         return torch.zeros((1, num_batches, self.num_hidden_features), dtype=torch.float64)
 
 #Model Variables
-num_epochs = 4 
-learning_rate = 1.0e-3 
-training_data_batch_size = 2 
-hidden_depth = 4
+num_epochs = 3 
+learning_rate = 1.0e-04 
+training_data_batch_size = 10 
+hidden_depth = 2 
 use_gpu = True 
 
 dataset = SensorDataset(hidden_depth=hidden_depth, use_gpu=True)
@@ -94,7 +95,7 @@ optimizer = torch.optim.SGD(
     [{'params': model.parameters()}],
     lr=learning_rate
 )
-loss_function = torch.nn.MSELoss()
+loss_function = torch.nn.L1Loss()
 
 #Dynamic Graph
 store_losses = []
@@ -102,18 +103,21 @@ store_losses = []
 #Progress Bar
 progress_bar = ProgressBar('processing', max=num_epochs * (len(training_dataset) / training_data_batch_size))
 
+def evaluate_sequence(inputs, batch_size): 
+    hidden = torch.tensor(model.get_zero_hidden(inputs.size(0)), requires_grad=True) 
+    y_pred, _hidden = model(inputs, hidden)
+
+    return y_pred[:, hidden_depth - 1, :]
+
+
 for epoch in range(num_epochs):
     avg_loss = 0
 
     #Move forward
     for i, (inputs, target) in enumerate(training_data_loader):
         #Get predictions
-        hidden = torch.clone(model.get_zero_hidden(training_data_batch_size)) 
-
-        y_pred, _hidden = model.forward(inputs, hidden)
-
         #Get last output of each RNN iteration to use as predition
-        y_pred = y_pred[:, hidden_depth - 1, :]
+        y_pred = evaluate_sequence(inputs, inputs.size(0))
 
         #Compute Loss
         #Only compute loss over final output, and not all outputs
@@ -134,6 +138,25 @@ progress_bar.finish()
 
 # Compute Loss over training data
 training_sample_inputs, training_sample_targets = next(iter(training_data_loader))
+sample_loss = loss_function(evaluate_sequence(training_sample_inputs, training_data_batch_size), training_sample_targets).detach().item()
+
+# Compute Loss over test data
+avg_loss = 1
+
+for i, (inputs, targets) in enumerate(test_data_loader):
+    prediction = evaluate_sequence(inputs, 1) 
+    print('predition was {pred} and target was {target}'.format(pred=prediction, target=targets))
+    avg_loss = avg_loss + loss_function(prediction, targets).detach().item()
+
+    #TODO DELETE
+    if i == 1:
+        break
+
+avg_loss = avg_loss / len(test_dataset)
+
+'''
+# Compute Loss over training data
+training_sample_inputs, training_sample_targets = next(iter(training_data_loader))
 hidden = torch.clone(model.get_zero_hidden(training_data_batch_size)) 
 sample_loss = loss_function(model(training_sample_inputs, hidden)[0][:, hidden_depth - 1, :], training_sample_targets).detach().item()
 
@@ -151,6 +174,7 @@ for i, (inputs, targets) in enumerate(test_data_loader):
         break
 
 avg_loss = avg_loss / len(test_dataset)
+'''
 
 print("model has " + str(sum([param.nelement() for param in model.parameters()])) + " parameters")
 print(f"sample loss was {sample_loss}")
