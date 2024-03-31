@@ -61,30 +61,19 @@ class HandwrittenClassifier(torch.nn.Module):
         super().__init__()
 
         image_dimensions = (28, 28) 
-
-        '''
-        conv_1 = torch.nn.Conv2d(in_channels=3, out_channels=6, kernel_size=11, stride=7, padding=2)
+ 
+        conv_1 = torch.nn.Conv2d(in_channels=1, out_channels=6, kernel_size=6, stride=1, padding='same')
         relu_1 = torch.nn.ReLU()
         max_pool_1 = torch.nn.MaxPool2d(kernel_size=2, stride=2)
-        conv_2 = torch.nn.Conv2d(in_channels=6, out_channels=15, kernel_size=5, stride=2, padding=2)
+        conv_2_1 = torch.nn.Conv2d(in_channels=6, out_channels=20, kernel_size=3, stride=1, padding='same')
+        conv_2_2= torch.nn.Conv2d(in_channels=20, out_channels=20, kernel_size=3, stride=1, padding='same')
+        conv_2_3 = torch.nn.Conv2d(in_channels=20, out_channels=10, kernel_size=3, stride=1, padding='same')
         relu_2 = torch.nn.ReLU()
-        max_pool_2 = torch.nn.MaxPool2d(kernel_size=4, stride=4)
+        max_pool_2 = torch.nn.MaxPool2d(kernel_size=2, stride=2)
         flatten_1 = torch.nn.Flatten(1, 3)
-        linear_1 = torch.nn.Linear(in_features=135, out_features=96)
+        linear_1 = torch.nn.Linear(in_features=490, out_features=10)
         relu_3 = torch.nn.ReLU()
-        linear_2 = torch.nn.Linear(in_features=96, out_features=15)
-        relu_4 = torch.nn.ReLU()
-        '''
- 
-        conv_1 = torch.nn.Conv2d(in_channels=1, out_channels=10, kernel_size=5, stride=1, padding='same')
-        relu_1 = torch.nn.ReLU()
-        max_pool_1 = torch.nn.MaxPool2d(kernel_size=4, stride=4)
-        relu_2 = torch.nn.ReLU()
-        flatten_1 = torch.nn.Flatten(1, 3)
-        linear_1 = torch.nn.Linear(in_features=490, out_features=92)
-        relu_3 = torch.nn.ReLU()
-        linear_2 = torch.nn.Linear(in_features=92, out_features=10)
-        self.net = torch.nn.Sequential(conv_1, relu_1, max_pool_1, relu_2, flatten_1, linear_1, relu_3, linear_2)
+        self.net = torch.nn.Sequential(conv_1, relu_1, max_pool_1, conv_2_1, conv_2_2, conv_2_3, relu_2, max_pool_2, flatten_1, linear_1, relu_3)
 
         if use_gpu:
             if torch.cuda.device_count() >= 1:
@@ -93,9 +82,9 @@ class HandwrittenClassifier(torch.nn.Module):
     def forward(self, X):
         return self.net(X)
 #Model Variables
-num_epochs = 4 
+num_epochs = 8 
 learning_rate = 1.0e-3 
-training_data_batch_size = 10 
+training_data_batch_size = 40 
 use_gpu = True 
 
 training_dataset = HandwritingDataset(use_gpu=True)
@@ -118,6 +107,8 @@ store_losses = []
 
 #Progress Bar
 progress_bar = ProgressBar('processing', max=num_epochs * (len(training_dataset) / training_data_batch_size))
+
+#Show how many parameters there are:
 
 for epoch in range(num_epochs):
     avg_loss = 0
@@ -148,17 +139,14 @@ training_sample_inputs, training_sample_targets = next(iter(training_data_loader
 sample_loss = loss_function(model(training_sample_inputs), training_sample_targets).detach().item()
 
 # Compute Loss over test data
-avg_loss = 1
+avg_loss = 0
+n = 0
 
 for i, (inputs, targets) in enumerate(test_data_loader):
-    print('predition was {pred} and target was {target}'.format(pred=model(inputs), target=targets))
     avg_loss = avg_loss + loss_function(model(inputs), targets).detach().item()
+    n += 1
 
-    #TODO DELETE
-    if i == 1:
-        break
-
-avg_loss = avg_loss / len(test_dataset)
+avg_loss = avg_loss / n 
 
 print("model has " + str(sum([param.nelement() for param in model.parameters()])) + " parameters")
 print(f"sample loss was {sample_loss}")
