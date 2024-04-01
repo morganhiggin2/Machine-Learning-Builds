@@ -60,7 +60,8 @@ class TimeSeriesSensorPredictor(torch.nn.Module):
         super().__init__()
 
         self.num_hidden_features = 3
-        self.net = torch.nn.RNN(input_size=3, hidden_size=self.num_hidden_features, num_layers=1, batch_first=True, dtype=torch.float64, nonlinearity='relu') 
+        self.gru = torch.nn.GRU(input_size=3, hidden_size=self.num_hidden_features, num_layers=1, batch_first=True, dtype=torch.float64) 
+        self.linear = torch.nn.Linear(3, 3, dtype=torch.float64) 
         self.hidden_depth = hidden_depth
 
         if use_gpu:
@@ -68,13 +69,15 @@ class TimeSeriesSensorPredictor(torch.nn.Module):
                 self.net.to(torch.device(f'cuda:{0}'))
 
     def forward(self, X, H):
-        return self.net(X, H)
+        output, hidden = self.gru(X, H)
+        output = self.linear(output)
+        return output, hidden
 
     def get_zero_hidden(self, num_batches):
         return torch.zeros((1, num_batches, self.num_hidden_features), dtype=torch.float64)
 
 #Model Variables
-num_epochs = 50 
+num_epochs = 150 
 learning_rate = 1.0e-03 
 training_data_batch_size = 10 
 hidden_depth = 4 
@@ -129,7 +132,7 @@ for epoch in range(num_epochs):
         loss.backward()
 
         #Clip gradients
-        torch.nn.utils.clip_grad_norm(model.parameters(), 2.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
 
         #increment weights
         optimizer.step()

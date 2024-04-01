@@ -60,24 +60,36 @@ class TimeSeriesSensorPredictor(torch.nn.Module):
         super().__init__()
 
         self.num_hidden_features = 3
-        self.net = torch.nn.RNN(input_size=3, hidden_size=self.num_hidden_features, num_layers=1, batch_first=True, dtype=torch.float64, nonlinearity='relu') 
+
+        self.lstm = torch.nn.LSTM(input_size=3, hidden_size=self.num_hidden_features, num_layers=1, batch_first=True, dtype=torch.float64) 
+        self.linear = torch.nn.Linear(in_features=3, out_features=3, dtype=torch.float64)
+
         self.hidden_depth = hidden_depth
 
         if use_gpu:
             if torch.cuda.device_count() >= 1:
-                self.net.to(torch.device(f'cuda:{0}'))
+                self.lstm.to(torch.device(f'cuda:{0}'))
+                self.relu.to(torch.device(f'cuda:{0}'))
 
-    def forward(self, X, H):
-        return self.net(X, H)
+    def forward(self, X, H=None, C=None):
+        hiddens = (H, C)
+
+        if not H or not C:
+            hiddens = None
+
+        output, hiddens = self.lstm(X, hiddens)
+        output = self.linear(output)
+
+        return output, hiddens[0], hiddens[1] 
 
     def get_zero_hidden(self, num_batches):
         return torch.zeros((1, num_batches, self.num_hidden_features), dtype=torch.float64)
 
 #Model Variables
-num_epochs = 50 
-learning_rate = 1.0e-03 
+num_epochs = 40 
+learning_rate = 1.0e-02 
 training_data_batch_size = 10 
-hidden_depth = 4 
+hidden_depth = 10 
 use_gpu = True 
 
 dataset = SensorDataset(hidden_depth=hidden_depth, use_gpu=True)
@@ -104,8 +116,9 @@ store_losses = []
 progress_bar = ProgressBar('processing', max=num_epochs * (len(training_dataset) / training_data_batch_size))
 
 def evaluate_sequence(inputs, batch_size): 
-    hidden = torch.tensor(model.get_zero_hidden(inputs.size(0)), requires_grad=True) 
-    y_pred, _hidden = model(inputs, hidden)
+    #hidden = torch.tensor(model.get_zero_hidden(inputs.size(0)), requires_grad=True) 
+    #canidate_hidden = torch.tensor(model.get_zero_hidden(inputs.size(0)), requires_grad=True) 
+    y_pred, _hidden, _canidate_hidden = model(inputs)
 
     return y_pred[:, hidden_depth - 1, :].unsqueeze(1)
 
@@ -129,7 +142,7 @@ for epoch in range(num_epochs):
         loss.backward()
 
         #Clip gradients
-        torch.nn.utils.clip_grad_norm(model.parameters(), 2.0)
+        #torch.nn.utils.clip_grad_norm(model.parameters(), 2.0)
 
         #increment weights
         optimizer.step()
