@@ -177,7 +177,7 @@ class TimeSeriesSensorPredictor(torch.nn.Module):
 
 
 #Model Variables
-num_epochs = 2 
+num_epochs = 20 
 learning_rate = 1.0e-02 
 training_data_batch_size = 4 
 # How many sequential inputs to use in prediction
@@ -234,7 +234,7 @@ for epoch in range(num_epochs):
         optimizer.step()
 
         #Compute batch loss for graph
-        store_losses += [loss.item()]
+        store_losses += [(loss / (target.sum() / input_depth / training_data_batch_size)).item()]
 
         progress_bar.next()
 
