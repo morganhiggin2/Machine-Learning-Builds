@@ -23,7 +23,7 @@ from progress.bar import Bar as ProgressBar
 
 #Data
 class CowDataset(Dataset):
-    def __init__(self, use_gpu=False):
+    def __init__(self, image_dimensions, use_gpu=False):
         self.use_gpu = use_gpu 
 
         self.sub_dir = "../data/cow_object_detection/"
@@ -38,7 +38,7 @@ class CowDataset(Dataset):
         # list of list, containing bouding boxes tuples for each image
         self.target_data = bounding_box_dataframe 
 
-        self.image_dimensions = (4200, 3200)
+        self.image_dimensions = image_dimensions
 
     def __read_xml(self, path):
         # Read xml file, credit to STPETE_ISHII of Kaggle
@@ -100,20 +100,29 @@ class CowDataset(Dataset):
         
         # Get image as tensor
         image_tensor = read_image(self.sub_dir + image_name)
-        image_size = image_tensor.size()
 
         # Pad image
         padded_image_tensor = torch.zeros((3, self.image_dimensions[0], self.image_dimensions[1]))
-        padded_image_tensor[:, 0:image_size[1], 0:image_size[2]] = image_tensor[:,:,:]
+        padded_image_tensor[:, 0:image_tensor.shape[1], 0:image_tensor.shape[2]] = image_tensor[:,:,:]
 
         if self.use_gpu:
             if torch.cuda.device_count() >= 1:
                     image_tensor.to(torch.device(f'cuda:{0}'))
+
+        image_data = self.target_data[self.target_data["filename"] == image_name]
         # Get class tensor of (N, 2) with first being if cow, second being not. Binary
-        class_tensor = torch.tensor([self.target_data[self.target_data['filename'] == image_name], self.target_data[self.target_data['filename'] == image_name]])
+        #class_tensor = torch.tensor([self.target_data[self.target_data['filename'] == image_name].to_numpy(), self.target_data[self.target_data['filename'] != image_name].to_numpy()])
+        #class_tensor = torch.tensor([numpy.ones(image_data.shape[0], dtype=numpy.float32), numpy.zeros(image_data.shape[0], dtype=numpy.float32)], requires_grad=True)
+        class_tensor = torch.zeros((image_data.shape[0], 2), dtype=torch.float32)
+        class_tensor[:, 0] = 1.0
+
+        # Get bounding boxes of each image of shape (N, 4) 
+        bouding_boxes = image_data[['xtl', 'ytl', 'xbr', 'ybr']].to_numpy()
+
+        bouding_boxes = torch.tensor(bouding_boxes)
 
         # Return image tensor, and bounding box information for this image
-        return padded_image_tensor, class_tensor
+        return padded_image_tensor, (bouding_boxes, class_tensor)
 
     # Helper methods to get tensor data from target data
     # TODO also include use_gpu move in this as well
@@ -133,7 +142,7 @@ class CowDetectionPredictor(torch.nn.Module):
         def block(in_channels, out_channels):
             conv_1 = torch.nn.Conv2d(in_channels, in_channels, kernel_size=(3, 3), stride=1, padding=(1, 1))
             conv_2 = torch.nn.Conv2d(in_channels, out_channels, kernel_size=(3, 3), stride=1, padding=(1, 1))
-            max_pool = torch.nn.MaxPool2d(kenel_size=(2, 2), stride=2)
+            max_pool = torch.nn.MaxPool2d(kernel_size=(2, 2), stride=2)
 
             return torch.nn.Sequential(conv_1, conv_2, max_pool)
 
@@ -144,7 +153,7 @@ class CowDetectionPredictor(torch.nn.Module):
         # Create sequence of blocks 
         self.conv_sequence = torch.nn.Sequential(block_1, block_2)
 
-        rpn = RegionPurposalNetwork(image_dimensions, use_gpu)
+        self.rpn = RegionPurposalNetwork(image_dimensions, use_gpu)
 
         # Fully connected layer
         linear_1_1 = torch.nn.Linear(2 * 28 * 28, 12)
@@ -152,20 +161,23 @@ class CowDetectionPredictor(torch.nn.Module):
 
         # Bouding box predictor
         linear_2_1_1 = torch.nn.Linear(12, 4)
+        self.bouding_box_predictor = torch.nn.Sequential(linear_2_1_1)
 
         # Classifier
-        lienar_2_2_1 = torch.nn.Linear(12, 2)
+        linear_2_2_1 = torch.nn.Linear(12, 2)
         softmax_1 = torch.nn.Softmax()
+        self.classifer = torch.nn.Sequential(linear_2_2_1, softmax_1)
 
         if use_gpu:
             if torch.cuda.device_count() >= 1:
                 self.net.to(torch.device(f'cuda:{0}'))
 
     def forward(self, X):
-        # convo layers
+        # X: (1, 3, image_dimensions[0], image_dimensions[1])
+        # convo layers -> (1, 1, image_dimensions[0]/200, image_dimensions[1]/200)
         reduced_image = self.conv_sequence(X)
-        
-        # region purposal network
+
+        # region purposal network -> 
         region_purposals = self.rpn(reduced_image)  
 
         # roi pooling (num_region_purposals, channels, width, hegith)
@@ -199,7 +211,7 @@ class RegionPurposalNetwork(torch.nn.Module):
 
         self.image_dimensions = image_dimensions
 
-        self.conv = torch.nn.Conv2d(in_channels=1, out_channels=2, kernel_size=(3, 3), padding=1)
+        self.conv = torch.nn.Conv2d(in_channels=1, out_channels=2, kernel_size=(50, 50), stride=50, padding=0)
 
         self.anchor_box_generator = AnchorGenerator(sizes=((16, 32, 64), ), aspect_ratios=((0.5, 1.0, 2.0), )) 
         self.feature_maps = [torch.empty((16, 16))]
@@ -214,28 +226,31 @@ class RegionPurposalNetwork(torch.nn.Module):
 
 
     def forward(self, X):
-        # Get conv pass output
+        # X: (1, 1, image_dimensions[0]/200, image_dimensions[1]/200)
+        # Get conv pass output -> (1, 2, image_dimensions[0]/200, image_dimensions[1]/200)
         Y = self.conv(X)
 
-        # Generate anchor boxes ()
-        anchor_boxes = self.anchor_box_generator(ImageList(Y.unsqueeze(0), ), self.feature_maps)
+        # Generate anchor boxes -> (image_dimensions[0]/200, image_dimensions[1]/200 * self.num_anchors, 4)
+        anchor_boxes = self.anchor_box_generator(ImageList(Y.squeeze(), [(self.image_dimensions[0]/200, self.image_dimensions[1]/200) * X.shape[1]]), Y)[0]
 
-        # Bounding box prediction (num_anchors * 4, x.size.0, x.size.1)
+        # Bounding box prediction (1, self.num_anchors * 4, image_dimensions[0]/200, image_dimensions[1]/200)
         bounding_box_offsets = self.bounding_box_predictor(Y) 
 
-        # Reshape into (num_anchors, 4, x.size.0, y.size.0) TODO
-        bounding_box_offsets = torch.reshape(bounding_box_offsets, (self.num_anchors, 4, X.shape[0], X.shape[1]))
+        # Reshape into (num_anchors, 4, image_dimensions[0]/200, image_dimensions[1]/200)
+        #bounding_box_offsets = torch.reshape(bounding_box_offsets, (self.num_anchors, 4, int(self.image_dimensions[0]/200), int(self.image_dimensions[1]/200)))
 
-        # Binary Class Prediction (object = 1, background = 0) (1, x.size.0, x.size.1)
+        # Binary Class Prediction (object = 1, background = 0) (1, 2, image_dimensions[0]/200, image_dimensions[1]/200)
         object_predictions = self.class_predictor(Y) 
-        object_predictions = self.softmax = self.softmax(object_predictions)
+        object_predictions = self.softmax(object_predictions)
 
-        # Based on a confidence interval, will determine if it can label class probability as object or background
+        # Based on a confidence interval, will determine if it can label class probability as object or background (2, image_dimensions[0]/200, image_dimensions[1]/200)
         object_prediction_mask = torch.gt(object_predictions[0,:,:], self.class_confidence)
 
-        # Filter out bouding box predictions which are not object labeled (from class_prediction)
+        # Filter out bouding box predictions which are not object labeled (from class_prediction) -> ()
         filtered_anchor_boxes = torch.masked_select(anchor_boxes, object_prediction_mask)
-        filtered_bounding_box_offsets = torch.masked_select(bounding_box_predictions, object_prediction_mask)
+        print(filtered_anchor_boxes.shape)
+        filtered_bounding_box_offsets = torch.masked_select(bounding_box_offsets, object_prediction_mask)
+        print(filtered_bounding_box_offsets.shape)
 
         bounding_box_predictions = apply_bounding_box_offsets_to_anchors(filtered_bounding_box_offsets, filtered_anchor_boxes)
 
@@ -255,22 +270,28 @@ class RegionPurposalNetwork(torch.nn.Module):
         # Return filtered bounding boxes as region purposals
         return filtered_bounding_box_prections 
 
+# Dataset variables
+image_dimensions = (4200, 3200)
 
 #Model Variables
 num_epochs = 4 
 learning_rate = 1.0e-3 
+# Batching disabled
 training_data_batch_size = 10 
 use_gpu = True 
 
-training_dataset = CowDataset(use_gpu=True)
-test_dataset = CowDataset(test=True, use_gpu=True)
+# Split set into training and test set
+dataset = CowDataset(image_dimensions, use_gpu=True)
+generator = torch.Generator().manual_seed(10)
+training_data_length = math.floor(0.8 * len(dataset)) 
+training_dataset, test_dataset = random_split(dataset, [training_data_length, len(dataset) - training_data_length], generator=generator) 
 
 #Generate data loaders for data
-training_data_loader = DataLoader(training_dataset, shuffle=True, batch_size=training_data_batch_size, num_workers=0)
+training_data_loader = DataLoader(training_dataset, shuffle=True, num_workers=0)
 test_data_loader = DataLoader(test_dataset, shuffle=True, num_workers=0)
 
 #Components
-model = CowDetectionPredictor()
+model = CowDetectionPredictor(image_dimensions)
 optimizer = torch.optim.SGD(
     [{'params': model.parameters()}],
     lr=learning_rate
@@ -295,12 +316,18 @@ for epoch in range(num_epochs):
 
     #Move forward
     for i, (inputs, targets) in enumerate(training_data_loader):
+        # inputs: (1, 2, image_dimension[0], image_dimensions[1])
+        # classes: (1, N, 2)
+        # bouding_boxes: (1, N, 4), top left to bottom right coordinates
+
         # Get targets
         bounding_boxes = targets[0]
         classes = targets[1]
 
         #Get predictions
         bounding_box_predictions, class_predictions = model.forward(inputs)
+
+        exit()
 
         #Compute Loss
         loss = loss_function(bounding_box_predictions, class_predictions, bounding_boxes, classes)
