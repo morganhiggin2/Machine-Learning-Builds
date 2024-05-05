@@ -129,10 +129,37 @@ class CowDataset(Dataset):
 
 # Apply bounding box offsets to anchor boxes
 def apply_bounding_box_offsets_to_anchors(anchors, offsets):
-    #TODO is it width and height, or x2 and y2
-    #anchors: (n, 4), x1, y1, 
-    #offsets: (n, 4)
-    return anchors + offsets
+    '''# offsets: ...[x_offset, y_offset, width_offset, height_offset]
+    # Apply positional offsets
+    anchors[:, :, 0:1, :, :] += offsets[:, :, 0:1, :, :]
+    anchors[:, :, 2:3, :, :] += offsets[:, :, 0:1, :, :]
+
+    # Apply size offsets
+    # x0' = x0 - woffset / 2
+    anchors[:, :, 0, :, :] -= offsets[:, :, 2, :, :] / 2
+    # x1' = x1 + woffset / 2
+    anchors[:, :, 2, :, :] += offsets[:, :, 2, :, :] / 2
+    # y0' = y0 - hoffset / 2
+    anchors[:, :, 1, :, :] -= offsets[:, :, 3, :, :] / 2
+    # y1' = y1 + hoffset / 2
+    anchors[:, :, 3, :, :] += offsets[:, :, 3, :, :] / 2'''
+    
+    # offsets: ...[x_offset, y_offset, width_offset, height_offset]
+    # Apply positional offsets
+    anchors[:, 0:1] += offsets[:, 0:1]
+    anchors[:, 2:3] += offsets[:, 0:1]
+
+    # Apply size offsets
+    # x0' = x0 - woffset / 2
+    anchors[:, 0] -= offsets[:, 2] / 2
+    # x1' = x1 + woffset / 2
+    anchors[:, 2] += offsets[:, 2] / 2
+    # y0' = y0 - hoffset / 2
+    anchors[:, 1] -= offsets[:, 3] / 2
+    # y1' = y1 + hoffset / 2
+    anchors[:, 3] += offsets[:, 3] / 2
+
+    return anchors
 
 class CowDetectionPredictor(torch.nn.Module):
     def __init__(self, image_dimensions, use_gpu=False):
@@ -192,7 +219,8 @@ class CowDetectionPredictor(torch.nn.Module):
         # Predict bounding box offsets
         offset_prediction = self.offset_predictor(fc_out)
         # Get bounding box predictions
-        bounding_box_predictions = apply_bounding_box_offsets_to_anchors(region_purposals, offset_prediction)
+
+        apply_bounding_box_offsets_to_anchors(region_purposals, offset_prediction)
 
         # Clip purposals
         clipped_bouding_box_predictions = clip_boxes_to_image(bounding_box_predictions, (X.shape[0], X.shape[1]))
@@ -206,69 +234,128 @@ class CowDetectionPredictor(torch.nn.Module):
 class RegionPurposalNetwork(torch.nn.Module):
     def __init__(self, image_dimensions, use_gpu=False):
         super().__init__()
-        self.num_anchors=9
         self.bounding_box_limit = 5
 
         self.image_dimensions = image_dimensions
 
         self.conv = torch.nn.Conv2d(in_channels=1, out_channels=2, kernel_size=(50, 50), stride=50, padding=0)
 
-        self.anchor_box_generator = AnchorGenerator(sizes=((16, 32, 64), ), aspect_ratios=((0.5, 1.0, 2.0), )) 
-        self.feature_maps = [torch.empty((16, 16))]
+        #self.anchor_box_generator = AnchorGenerator(sizes=((16, 32, 64), ), aspect_ratios=((0.5, 1.0, 2.0), )) 
+        self.__init_anchor_boxes__(sizes=[1.0, 2.0], aspect_ratios=[0.5, 1.0, 2.0], feature_map_size=(int(self.image_dimensions[0]/200), int(self.image_dimensions[1]/200)))
 
         # Predict the offsets
         self.bounding_box_predictor = torch.nn.Conv2d(in_channels=2, out_channels=self.num_anchors*4, kernel_size=(3, 3), padding=(1, 1))
         
         # Predict class labels
-        self.class_predictor = torch.nn.Conv2d(in_channels=2, out_channels=2, kernel_size=(3, 3), padding=(1, 1))
+        conv_1 = torch.nn.Conv2d(in_channels=2, out_channels=self.num_anchors, kernel_size=(3, 3), padding=(1, 1))
+        tan_h = torch.nn.Tanh()
+        self.class_predictor = torch.nn.Sequential(conv_1, tan_h) 
+
         self.softmax = torch.nn.Softmax2d()
         self.class_confidence = 0.95
-
 
     def forward(self, X):
         # X: (1, 1, image_dimensions[0]/200, image_dimensions[1]/200)
         # Get conv pass output -> (1, 2, image_dimensions[0]/200, image_dimensions[1]/200)
         Y = self.conv(X)
 
-        # Generate anchor boxes -> (image_dimensions[0]/200, image_dimensions[1]/200 * self.num_anchors, 4)
-        anchor_boxes = self.anchor_box_generator(ImageList(Y.squeeze(), [(self.image_dimensions[0]/200, self.image_dimensions[1]/200) * X.shape[1]]), Y)[0]
+        # Generate anchor boxes -> (1, self.num_anchors, 4,  image_dimensions[0]/200, image_dimensions[1]/200)
+        #PROBLEM we are doing this on the feature map, need to change the size of the anchor boxes, then scale up for the original image (after original convo)
+        anchor_boxes = self.__generate_anchor_boxes__().unsqueeze(0) 
 
         # Bounding box prediction (1, self.num_anchors * 4, image_dimensions[0]/200, image_dimensions[1]/200)
         bounding_box_offsets = self.bounding_box_predictor(Y) 
+        bounding_box_offsets = torch.reshape(bounding_box_offsets, shape=(self.num_anchors, 4, int(self.image_dimensions[0]/200), int(self.image_dimensions[1]/200)))
 
         # Reshape into (num_anchors, 4, image_dimensions[0]/200, image_dimensions[1]/200)
         #bounding_box_offsets = torch.reshape(bounding_box_offsets, (self.num_anchors, 4, int(self.image_dimensions[0]/200), int(self.image_dimensions[1]/200)))
 
-        # Binary Class Prediction (object = 1, background = 0) (1, 2, image_dimensions[0]/200, image_dimensions[1]/200)
+        # Binary Class Prediction (object = 1, background = 0) (1, self.num_anchors, image_dimensions[0]/200, image_dimensions[1]/200)
         object_predictions = self.class_predictor(Y) 
-        object_predictions = self.softmax(object_predictions)
+        # (1, self.num_anchors * image_dimensions[0]/200 * image_dimensions[1]/200)
 
-        # Based on a confidence interval, will determine if it can label class probability as object or background (2, image_dimensions[0]/200, image_dimensions[1]/200)
-        object_prediction_mask = torch.gt(object_predictions[0,:,:], self.class_confidence)
+        #TODO REMOVE
+        object_predictions[0, :, 0, 0] = 1.0        
+
+        # Based on a confidence interval, will determine if it can label class probability as object or background (1, self.num_anchors, image_dimensions[0]/200, image_dimensions[1]/200)
+        object_prediction_mask = torch.gt(object_predictions, self.class_confidence).unsqueeze(2)
+        # Then to (1, self.num_anchors, 4, image_dimensions[0]/200, image_dimensions[1]/200)
+        #object_prediction_mask = object_prediction_mask.expand(1, self.num_anchors, 4, int(self.image_dimensions[0]/200), int(self.image_dimensions[1]/200))
+
+        # List of boxes for each batch
+        region_purposals = []
 
         # Filter out bouding box predictions which are not object labeled (from class_prediction) -> ()
-        filtered_anchor_boxes = torch.masked_select(anchor_boxes, object_prediction_mask)
-        print(filtered_anchor_boxes.shape)
-        filtered_bounding_box_offsets = torch.masked_select(bounding_box_offsets, object_prediction_mask)
-        print(filtered_bounding_box_offsets.shape)
+        for i in range(0, anchor_boxes.shape[0]): 
+            filtered_anchor_boxes = torch.masked_select(anchor_boxes[i], object_prediction_mask[i])
+            filtered_bounding_box_offsets = torch.masked_select(bounding_box_offsets[i], object_prediction_mask[i])
 
-        bounding_box_predictions = apply_bounding_box_offsets_to_anchors(filtered_bounding_box_offsets, filtered_anchor_boxes)
+            filtered_anchor_boxes = filtered_anchor_boxes.reshape(shape=(int(filtered_anchor_boxes.shape[0] / 4), 4))
+            filtered_bounding_box_offsets = filtered_bounding_box_offsets.reshape(shape=(int(filtered_bounding_box_offsets.shape[0] / 4), 4))
 
-        # Clip out of image anchor boxes
-        filtered_bounding_box_prections = clip_boxes_to_image(filtered_bounding_box_prections, (X.shape[0], X.shape[1]))
+            # Get bouding box preditions from offsets
+            bounding_box_predictions = apply_bounding_box_offsets_to_anchors(filtered_bounding_box_offsets, filtered_anchor_boxes)
 
-        #TODO filter anchor boxes, for now, lets get say at most the top n anchor boxes
-        # Calculate IOU of every box with respect to every other
-        #iou_scores = box_iou(filtered_bounding_boxes, anchor_boxes) 
-        # Get iou scores (num filtered bouding boxes, num anchor boxes)
-        # Non maximum surpression using the filtered predicted bounding boxes
-        # Gets indicies of kept region purposals
-        #region_purposals_indicies = [non_max_surpression(anchor_boxes, anchor_box_iou_scores, iou_threshold=0.7) for anchor_box_iou_score in iou_scores]
-        if filtered_bounding_box_prections.shape[0] > self.bounding_box_limit:
-            filtered_bounding_box_prections = filtered_bounding_box_prections[0:5, :, :, :]
+            # Clip out of image anchor boxes
+            filtered_bounding_box_prections = clip_boxes_to_image(bounding_box_predictions, size=(int(self.image_dimensions[0]/200), int(self.image_dimensions[1]/200)))
+
+            #TODO filter anchor boxes, for now, lets get say at most the top n anchor boxes
+            # Calculate IOU of every box with respect to every other
+            #iou_scores = box_iou(filtered_bounding_boxes, anchor_boxes) 
+            # Get iou scores (num filtered bouding boxes, num anchor boxes)
+            # Non maximum surpression using the filtered predicted bounding boxes
+            # Gets indicies of kept region purposals
+            #region_purposals_indicies = [non_max_surpression(anchor_boxes, anchor_box_iou_scores, iou_threshold=0.7) for anchor_box_iou_score in iou_scores]
+            if filtered_bounding_box_prections.shape[0] > self.bounding_box_limit:
+                filtered_bounding_box_prections = filtered_bounding_box_prections[0:5, :]
+
+            region_purposals += [filtered_bounding_box_prections] 
 
         # Return filtered bounding boxes as region purposals
-        return filtered_bounding_box_prections 
+        return torch.stack(region_purposals, dim=0)
+
+    def __init_anchor_boxes__(self, sizes: list, aspect_ratios: list, feature_map_size: tuple):
+        # Checks
+        if feature_map_size[0] % 1.0 != 0.0 or feature_map_size[1] % 1.0 != 0.0:
+            raise Exception("Feature map is not of integer like amount") 
+
+        self.num_anchors = len(sizes) * len(aspect_ratios)
+
+        # Generate individual anchor boxes as one tensor
+        individual_anchor_boxes = []
+
+        for size in sizes:
+            for aspect_ratio in aspect_ratios:
+                individual_anchor_boxes += [[0.0, size * -(aspect_ratio - 1) / 2, size, size * (1 + (aspect_ratio - 1) / 2)]]
+
+        # (num_anchors, 4)
+        individual_anchor_boxes = torch.tensor(individual_anchor_boxes)
+
+        # Expand to get w * h more anchor boses 
+        # self.num_anchors, 4, feature_map_size[0], feature_map_size[1] 
+
+        # unsqueeze each inner dimension, then expand the unsqueeze dimension (duplicating value) to get new shape
+        # (num_anchor_boxes, 4, feature_map_size[0], feature_map_size[1])
+        individual_anchor_boxes = individual_anchor_boxes.unsqueeze(2).expand(individual_anchor_boxes.shape[0], individual_anchor_boxes.shape[1], feature_map_size[0])
+        individual_anchor_boxes = individual_anchor_boxes.unsqueeze(3).expand(individual_anchor_boxes.shape[0], individual_anchor_boxes.shape[1], feature_map_size[0], feature_map_size[1])
+
+        # generate position offset tensor
+
+        # broadcast tensors to get w * h position offset
+        x_offset_tensor = torch.arange(0, int(feature_map_size[0])).unsqueeze(1).expand(feature_map_size[0], feature_map_size[1]).unsqueeze(0)
+        y_offset_tensor = torch.arange(0, int(feature_map_size[1])).unsqueeze(0).expand(feature_map_size[0], feature_map_size[1]).unsqueeze(0)
+
+        # (self.num_anchors, 4, feature_map_size[0], feature_map_size[1])
+        position_offset_tensor = torch.cat((x_offset_tensor, y_offset_tensor, x_offset_tensor, y_offset_tensor), 0) 
+        position_offset_tensor = position_offset_tensor.expand(self.num_anchors, 4, feature_map_size[0], feature_map_size[1])
+
+        # apply offsets to anchor boxes
+        self.anchor_boxes = torch.add(individual_anchor_boxes, position_offset_tensor)
+
+    def __generate_anchor_boxes__(self):
+        # Return copy of anchor boxes, set require_grad=True
+        return self.anchor_boxes.clone().detach().requires_grad_(True)
+
 
 # Dataset variables
 image_dimensions = (4200, 3200)
