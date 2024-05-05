@@ -182,6 +182,8 @@ class CowDetectionPredictor(torch.nn.Module):
 
         self.rpn = RegionPurposalNetwork(image_dimensions, use_gpu)
 
+        self.roi_output_size = (2, 2)
+
         # Fully connected layer
         linear_1_1 = torch.nn.Linear(2 * 28 * 28, 12)
         self.fc = torch.nn.Sequential(linear_1_1)
@@ -208,7 +210,7 @@ class CowDetectionPredictor(torch.nn.Module):
         region_purposals = self.rpn(reduced_image)  
 
         # roi pooling (num_region_purposals, channels, width, hegith)
-        pooled_rois = roi_pool(reduced_image, [region_purposals])
+        pooled_rois = roi_pool(reduced_image, [region_purposals], self.roi_output_size)
 
         # flatten region purposals (num_region_purposals, channels * width * height)
         flattened_rois = torch.flatten(4, 2 * pooled_rois.shape[0] * pooled_rois.shape[1])
@@ -237,11 +239,15 @@ class RegionPurposalNetwork(torch.nn.Module):
         self.bounding_box_limit = 5
 
         self.image_dimensions = image_dimensions
+        # shape of the input X, must know before hand
+        self.input_shape = (self.image_dimensions[0]/4, self.image_dimensions[1]/4)
+        # shape of the output of conv network after X, must know before hand
+        self.cnn_output_shape = (self.image_dimensions[0]/200, self.image_dimensions[1]/200)
 
         self.conv = torch.nn.Conv2d(in_channels=1, out_channels=2, kernel_size=(50, 50), stride=50, padding=0)
 
         #self.anchor_box_generator = AnchorGenerator(sizes=((16, 32, 64), ), aspect_ratios=((0.5, 1.0, 2.0), )) 
-        self.__init_anchor_boxes__(sizes=[1.0, 2.0], aspect_ratios=[0.5, 1.0, 2.0], feature_map_size=(int(self.image_dimensions[0]/200), int(self.image_dimensions[1]/200)))
+        self.__init_anchor_boxes__(sizes=[1.0, 2.0], aspect_ratios=[0.5, 1.0, 2.0], feature_map_size=(int(self.cnn_output_shape[0]), int(self.cnn_output_shape[1])))
 
         # Predict the offsets
         self.bounding_box_predictor = torch.nn.Conv2d(in_channels=2, out_channels=self.num_anchors*4, kernel_size=(3, 3), padding=(1, 1))
@@ -255,9 +261,11 @@ class RegionPurposalNetwork(torch.nn.Module):
         self.class_confidence = 0.95
 
     def forward(self, X):
+        print(X.shape)
         # X: (1, 1, image_dimensions[0]/200, image_dimensions[1]/200)
         # Get conv pass output -> (1, 2, image_dimensions[0]/200, image_dimensions[1]/200)
         Y = self.conv(X)
+        print(Y.shape)
 
         # Generate anchor boxes -> (1, self.num_anchors, 4,  image_dimensions[0]/200, image_dimensions[1]/200)
         #PROBLEM we are doing this on the feature map, need to change the size of the anchor boxes, then scale up for the original image (after original convo)
@@ -265,7 +273,7 @@ class RegionPurposalNetwork(torch.nn.Module):
 
         # Bounding box prediction (1, self.num_anchors * 4, image_dimensions[0]/200, image_dimensions[1]/200)
         bounding_box_offsets = self.bounding_box_predictor(Y) 
-        bounding_box_offsets = torch.reshape(bounding_box_offsets, shape=(self.num_anchors, 4, int(self.image_dimensions[0]/200), int(self.image_dimensions[1]/200)))
+        bounding_box_offsets = torch.reshape(bounding_box_offsets, shape=(self.num_anchors, 4, int(self.cnn_output_shape[0]), int(self.cnn_output_shape[1])))
 
         # Reshape into (num_anchors, 4, image_dimensions[0]/200, image_dimensions[1]/200)
         #bounding_box_offsets = torch.reshape(bounding_box_offsets, (self.num_anchors, 4, int(self.image_dimensions[0]/200), int(self.image_dimensions[1]/200)))
@@ -273,9 +281,6 @@ class RegionPurposalNetwork(torch.nn.Module):
         # Binary Class Prediction (object = 1, background = 0) (1, self.num_anchors, image_dimensions[0]/200, image_dimensions[1]/200)
         object_predictions = self.class_predictor(Y) 
         # (1, self.num_anchors * image_dimensions[0]/200 * image_dimensions[1]/200)
-
-        #TODO REMOVE
-        object_predictions[0, :, 0, 0] = 1.0        
 
         # Based on a confidence interval, will determine if it can label class probability as object or background (1, self.num_anchors, image_dimensions[0]/200, image_dimensions[1]/200)
         object_prediction_mask = torch.gt(object_predictions, self.class_confidence).unsqueeze(2)
@@ -290,14 +295,13 @@ class RegionPurposalNetwork(torch.nn.Module):
             filtered_anchor_boxes = torch.masked_select(anchor_boxes[i], object_prediction_mask[i])
             filtered_bounding_box_offsets = torch.masked_select(bounding_box_offsets[i], object_prediction_mask[i])
 
+            # If we have no predicitons
+            # If one has none, the other won't as well, since they use the same mask
+            if filtered_anchor_boxes.shape[0] == 0:
+                return torch.empty((0, 4)) 
+
             filtered_anchor_boxes = filtered_anchor_boxes.reshape(shape=(int(filtered_anchor_boxes.shape[0] / 4), 4))
             filtered_bounding_box_offsets = filtered_bounding_box_offsets.reshape(shape=(int(filtered_bounding_box_offsets.shape[0] / 4), 4))
-
-            # Get bouding box preditions from offsets
-            bounding_box_predictions = apply_bounding_box_offsets_to_anchors(filtered_bounding_box_offsets, filtered_anchor_boxes)
-
-            # Clip out of image anchor boxes
-            filtered_bounding_box_prections = clip_boxes_to_image(bounding_box_predictions, size=(int(self.image_dimensions[0]/200), int(self.image_dimensions[1]/200)))
 
             #TODO filter anchor boxes, for now, lets get say at most the top n anchor boxes
             # Calculate IOU of every box with respect to every other
@@ -306,13 +310,26 @@ class RegionPurposalNetwork(torch.nn.Module):
             # Non maximum surpression using the filtered predicted bounding boxes
             # Gets indicies of kept region purposals
             #region_purposals_indicies = [non_max_surpression(anchor_boxes, anchor_box_iou_scores, iou_threshold=0.7) for anchor_box_iou_score in iou_scores]
-            if filtered_bounding_box_prections.shape[0] > self.bounding_box_limit:
-                filtered_bounding_box_prections = filtered_bounding_box_prections[0:5, :]
+            if filtered_anchor_boxes.shape[0] >= 5:
+                filtered_anchor_boxes = filtered_anchor_boxes[0:5, :]
+                filtered_bounding_box_offsets = filtered_bounding_box_offsets[0:5, :]
 
-            region_purposals += [filtered_bounding_box_prections] 
+            # Get bouding box preditions from offsets
+            bounding_box_predictions = apply_bounding_box_offsets_to_anchors(filtered_bounding_box_offsets, filtered_anchor_boxes)
 
-        # Return filtered bounding boxes as region purposals
-        return torch.stack(region_purposals, dim=0)
+            # Clip out of image anchor boxes
+            filtered_bounding_box_predictions = clip_boxes_to_image(bounding_box_predictions, size=(int(self.image_dimensions[0]/200), int(self.image_dimensions[1]/200)))
+
+            # Scale coordinates to bring back to original imput image
+            filtered_bounding_box_predictions[:, 0] *= self.input_shape[0] / self.cnn_output_shape[0]
+            filtered_bounding_box_predictions[:, 2] *= self.input_shape[0] / self.cnn_output_shape[0]
+            filtered_bounding_box_predictions[:, 1] *= self.input_shape[1] / self.cnn_output_shape[1]
+            filtered_bounding_box_predictions[:, 3] *= self.input_shape[1] / self.cnn_output_shape[1]
+
+            region_purposals += [filtered_bounding_box_predictions] 
+
+        # Return filtered bounding boxes as region purposals, with each element of the input list being stacked is region purposals for that batch
+        return region_purposals
 
     def __init_anchor_boxes__(self, sizes: list, aspect_ratios: list, feature_map_size: tuple):
         # Checks
@@ -355,7 +372,6 @@ class RegionPurposalNetwork(torch.nn.Module):
     def __generate_anchor_boxes__(self):
         # Return copy of anchor boxes, set require_grad=True
         return self.anchor_boxes.clone().detach().requires_grad_(True)
-
 
 # Dataset variables
 image_dimensions = (4200, 3200)
