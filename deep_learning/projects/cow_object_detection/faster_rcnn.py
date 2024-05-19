@@ -102,7 +102,10 @@ class CowDataset(Dataset):
         image_tensor = read_image(self.sub_dir + image_name)
 
         # Pad image
+        print(self.image_dimensions)
         padded_image_tensor = torch.zeros((3, self.image_dimensions[0], self.image_dimensions[1]))
+        print(padded_image_tensor.shape)
+        print(image_tensor.shape)
         padded_image_tensor[:, 0:image_tensor.shape[1], 0:image_tensor.shape[2]] = image_tensor[:,:,:]
 
         if self.use_gpu:
@@ -185,7 +188,7 @@ class CowDetectionPredictor(torch.nn.Module):
         self.roi_output_size = (2, 2)
 
         # Fully connected layer
-        linear_1_1 = torch.nn.Linear(2 * 28 * 28, 12)
+        linear_1_1 = torch.nn.Linear(4, 12)
         self.fc = torch.nn.Sequential(linear_1_1)
 
         # Bouding box predictor
@@ -194,8 +197,8 @@ class CowDetectionPredictor(torch.nn.Module):
 
         # Classifier
         linear_2_2_1 = torch.nn.Linear(12, 2)
-        softmax_1 = torch.nn.Softmax()
-        self.classifer = torch.nn.Sequential(linear_2_2_1, softmax_1)
+        softmax_1 = torch.nn.Softmax(dim=1)
+        self.classifier = torch.nn.Sequential(linear_2_2_1, softmax_1)
 
         if use_gpu:
             if torch.cuda.device_count() >= 1:
@@ -206,32 +209,43 @@ class CowDetectionPredictor(torch.nn.Module):
         # convo layers -> (1, 1, image_dimensions[0]/200, image_dimensions[1]/200)
         reduced_image = self.conv_sequence(X)
 
-        # region purposal network -> 
+        # region purposal network -> [tensor(num_region_purposals, 4)]
         region_purposals = self.rpn(reduced_image)  
 
-        # roi pooling (num_region_purposals, channels, width, hegith)
-        pooled_rois = roi_pool(reduced_image, [region_purposals], self.roi_output_size)
+        clipped_bounding_box_predictions = []
+        classification_predictions = []
 
-        # flatten region purposals (num_region_purposals, channels * width * height)
-        flattened_rois = torch.flatten(4, 2 * pooled_rois.shape[0] * pooled_rois.shape[1])
+        # roi pooling for each batch (num_region_purposals, channels, width, hegith)
+        for i in range(len(region_purposals)):
+            # If we have no region purposals
+            if region_purposals[i] == None:
+                clipped_bounding_box_predictions += [torch.empty(size=tuple(0))]          
+                classification_predictions += [torch.empty(size=tuple(0))]
+                continue
 
-        # Apply fully connected layer
-        fc_out = self.fc(flattened_rois)
+            pooled_roi = roi_pool(input=reduced_image, boxes=[region_purposals[i]], output_size=self.roi_output_size)
 
-        # Predict bounding box offsets
-        offset_prediction = self.offset_predictor(fc_out)
-        # Get bounding box predictions
+            # flatten region purposals (num_region_purposals, channels * width * height)
+            flattened_rois = torch.flatten(input=pooled_roi, start_dim=1, end_dim=3)
 
-        apply_bounding_box_offsets_to_anchors(region_purposals, offset_prediction)
+            # Apply fully connected layer (num_region_purposals, 12)
+            fc_out = self.fc(flattened_rois)
 
-        # Clip purposals
-        clipped_bouding_box_predictions = clip_boxes_to_image(bounding_box_predictions, (X.shape[0], X.shape[1]))
+            # Predict bounding box offsets (num_region_purposals, 4)
+            offset_prediction = self.bouding_box_predictor(fc_out)
 
-        # Predict bouding box classification (cow or not cow)
-        classification_prediction = self.classifier(fc_out)
+            # Get bounding box predictions
+            bounding_box_predictions = apply_bounding_box_offsets_to_anchors(region_purposals[i], offset_prediction)
+
+            # Clip purposals
+            clipped_bounding_box_predictions += [clip_boxes_to_image(bounding_box_predictions, (X.shape[0], X.shape[1]))]
+
+            # Predict bouding box classification (cow or not cow) (num_region_purposals, 2)
+            classification_predictions += [self.classifier(fc_out)]
        
         # Return as bouding box predictions, bouding box classification
-        return clipped_bouding_box_predictions, classification_prediction 
+        # Stack list of bounding box predictions for each batch into one tensor
+        return torch.stack(tensors=clipped_bounding_box_predictions, dim=0), torch.stack(classification_predictions, dim=0)
 
 class RegionPurposalNetwork(torch.nn.Module):
     def __init__(self, image_dimensions, use_gpu=False):
@@ -261,11 +275,9 @@ class RegionPurposalNetwork(torch.nn.Module):
         self.class_confidence = 0.95
 
     def forward(self, X):
-        print(X.shape)
         # X: (1, 1, image_dimensions[0]/200, image_dimensions[1]/200)
         # Get conv pass output -> (1, 2, image_dimensions[0]/200, image_dimensions[1]/200)
         Y = self.conv(X)
-        print(Y.shape)
 
         # Generate anchor boxes -> (1, self.num_anchors, 4,  image_dimensions[0]/200, image_dimensions[1]/200)
         #PROBLEM we are doing this on the feature map, need to change the size of the anchor boxes, then scale up for the original image (after original convo)
@@ -283,6 +295,7 @@ class RegionPurposalNetwork(torch.nn.Module):
         # (1, self.num_anchors * image_dimensions[0]/200 * image_dimensions[1]/200)
 
         # Based on a confidence interval, will determine if it can label class probability as object or background (1, self.num_anchors, image_dimensions[0]/200, image_dimensions[1]/200)
+        # TODO replace with top k, maintain original order however
         object_prediction_mask = torch.gt(object_predictions, self.class_confidence).unsqueeze(2)
         # Then to (1, self.num_anchors, 4, image_dimensions[0]/200, image_dimensions[1]/200)
         #object_prediction_mask = object_prediction_mask.expand(1, self.num_anchors, 4, int(self.image_dimensions[0]/200), int(self.image_dimensions[1]/200))
@@ -298,7 +311,8 @@ class RegionPurposalNetwork(torch.nn.Module):
             # If we have no predicitons
             # If one has none, the other won't as well, since they use the same mask
             if filtered_anchor_boxes.shape[0] == 0:
-                return torch.empty((0, 4)) 
+                region_purposals += [None]
+                continue
 
             filtered_anchor_boxes = filtered_anchor_boxes.reshape(shape=(int(filtered_anchor_boxes.shape[0] / 4), 4))
             filtered_bounding_box_offsets = filtered_bounding_box_offsets.reshape(shape=(int(filtered_bounding_box_offsets.shape[0] / 4), 4))
@@ -374,7 +388,9 @@ class RegionPurposalNetwork(torch.nn.Module):
         return self.anchor_boxes.clone().detach().requires_grad_(True)
 
 # Dataset variables
-image_dimensions = (4200, 3200)
+image_dimensions = (4320, 4320)
+# Maximum number of bouding box predictions
+num_bouding_box_predictions = 5
 
 #Model Variables
 num_epochs = 4 
@@ -403,6 +419,12 @@ bounding_box_loss_function = torch.nn.L1Loss(reduction='none')
 classification_loss_function = torch.nn.CrossEntropyLoss(reduction='mean')
 
 def loss_function(bounding_box_predictions, classification_predictions, bounding_boxes, classes):
+    #TODO what to do if the num of predicted bouding boxes and classes is less than in the image
+    #TODO sort the target predictions and classes in the same order that the predictions are in OR 
+        # apply an algorithm to find the n closest ones to the predictions, then use the losses from there (make sure classes match too)
+
+    #TODO sort targets in same order as predicions (x, y) order (create new field for this dimension as x + y * w to sort on)
+    
     bounding_box_loss = bounding_box_loss_function(bounding_box_predictions, bounding_boxes)
     classification_loss = classification_loss_function(classification_predictions, classes)
 
@@ -429,8 +451,6 @@ for epoch in range(num_epochs):
 
         #Get predictions
         bounding_box_predictions, class_predictions = model.forward(inputs)
-
-        exit()
 
         #Compute Loss
         loss = loss_function(bounding_box_predictions, class_predictions, bounding_boxes, classes)
@@ -459,7 +479,7 @@ sample_loss = loss_function(model(training_sample_inputs), training_sample_targe
 avg_loss = 1
 
 for i, (inputs, targets) in enumerate(test_data_loader):
-    print('predition was {pred} and target was {target}'.format(pred=model(inputs), target=targets))
+    ('predition was {pred} and target was {target}'.format(pred=model(inputs), target=targets))
     avg_loss = avg_loss + loss_function(model(inputs), targets).detach().item()
 
     #TODO DELETE
@@ -468,9 +488,9 @@ for i, (inputs, targets) in enumerate(test_data_loader):
 
 avg_loss = avg_loss / len(test_dataset)
 
-print("model has " + str(sum([param.nelement() for param in model.parameters()])) + " parameters")
-print(f"sample loss was {sample_loss}")
-print(f"test data loss was {avg_loss}")
+("model has " + str(sum([param.nelement() for param in model.parameters()])) + " parameters")
+(f"sample loss was {sample_loss}")
+(f"test data loss was {avg_loss}")
 
 #Plot with matplotlib
 pyplot.style.use('ggplot')
