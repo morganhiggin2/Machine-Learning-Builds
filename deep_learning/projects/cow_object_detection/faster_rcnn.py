@@ -20,6 +20,7 @@ from progress.bar import Bar as ProgressBar
 #get overlap matrix
 #get best region predictions by method of maximum ...
 
+MAXIUMUM_BOUDING_BOXES = 5
 
 #Data
 class CowDataset(Dataset):
@@ -219,8 +220,8 @@ class CowDetectionPredictor(torch.nn.Module):
         for i in range(len(region_purposals)):
             # If we have no region purposals
             if region_purposals[i] == None:
-                clipped_bounding_box_predictions += [torch.empty(size=tuple(0))]          
-                classification_predictions += [torch.empty(size=tuple(0))]
+                clipped_bounding_box_predictions += [torch.empty(size=(0))]          
+                classification_predictions += [torch.empty(size=(0))]
                 continue
 
             pooled_roi = roi_pool(input=reduced_image, boxes=[region_purposals[i]], output_size=self.roi_output_size)
@@ -324,9 +325,9 @@ class RegionPurposalNetwork(torch.nn.Module):
             # Non maximum surpression using the filtered predicted bounding boxes
             # Gets indicies of kept region purposals
             #region_purposals_indicies = [non_max_surpression(anchor_boxes, anchor_box_iou_scores, iou_threshold=0.7) for anchor_box_iou_score in iou_scores]
-            if filtered_anchor_boxes.shape[0] >= 5:
-                filtered_anchor_boxes = filtered_anchor_boxes[0:5, :]
-                filtered_bounding_box_offsets = filtered_bounding_box_offsets[0:5, :]
+            if filtered_anchor_boxes.shape[0] > MAXIUMUM_BOUDING_BOXES:
+                filtered_anchor_boxes = filtered_anchor_boxes[0:MAXIUMUM_BOUDING_BOXES, :]
+                filtered_bounding_box_offsets = filtered_bounding_box_offsets[0:MAXIUMUM_BOUDING_BOXES, :]
 
             # Get bouding box preditions from offsets
             bounding_box_predictions = apply_bounding_box_offsets_to_anchors(filtered_bounding_box_offsets, filtered_anchor_boxes)
@@ -418,12 +419,78 @@ optimizer = torch.optim.SGD(
 bounding_box_loss_function = torch.nn.L1Loss(reduction='none')
 classification_loss_function = torch.nn.CrossEntropyLoss(reduction='mean')
 
+def pair_bounding_boxes_by_closeness(distances):
+    distances = distances.clone()
+
+    num_predictions, num_targets = distances.shape
+
+    if num_predictions != num_targets:
+        print("ERROR number of predicted boxes does not match the number of target boxes")
+        return
+
+    prediction_ordering = [None] * num_predictions 
+
+    for i in range(num_predictions):
+        # get closest one, ommiting selected boxes
+        box_distances = distances[i]
+
+        # get index of minimum value
+        # this index is the index of the target bounding box for which i predicted bounding box is closest to
+        min_index = torch.argmin(box_distances)
+
+        prediction_ordering[i] = min_index
+
+        # set all distances for the target bounding box to infinity, as this box is taken and cannot be selected again
+        distances[:, min_index] = torch.inf
+
+    return prediction_ordering
+
 def loss_function(bounding_box_predictions, classification_predictions, bounding_boxes, classes):
     #TODO what to do if the num of predicted bouding boxes and classes is less than in the image
-    #TODO sort the target predictions and classes in the same order that the predictions are in OR 
-        # apply an algorithm to find the n closest ones to the predictions, then use the losses from there (make sure classes match too)
+    #    assign default error 
+    if len(bounding_box_predictions) > len(bounding_boxes):
+        over_loss = 0.4 * (len(bounding_box_predictions) - len(bounding_boxes))
+        bounding_box_predictions = bounding_box_predictions[0:len(bounding_boxes)]
+        classification_predictions = classification_predictions[0:len(bounding_boxes)]
+    else:
+        over_loss = 0
 
-    #TODO sort targets in same order as predicions (x, y) order (create new field for this dimension as x + y * w to sort on)
+    #TODO what if there are more predictions that there are bouding boxes in the image
+    #    assign default error
+    if len(bounding_box_predictions) > len(bounding_boxes):
+        under_loss = 0.4 * (len(bounding_box_predictions) - len(bounding_boxes))
+        bounding_boxes = bounding_boxes[0:len(bounding_box_predictions)]
+        classes = classes[0:len(classification_predictions)]
+    else:
+        under_loss = 0
+    
+    # Derive distance tensor 
+    # Get broadcasted matracies ready for element wise operations, with bouding box centers calculated
+    # Get bounding box prediction centers
+    bbox_pred_tensor = torch.zeros((bounding_box_predictions.size(0), 1, 2)) 
+    bbox_pred_tensor[:, 0, 0] = (bounding_box_predictions[:, 0] + bounding_box_predictions[:, 2]) / 2
+    bbox_pred_tensor[:, 0, 1] = (bounding_box_predictions[:, 1] + bounding_box_predictions[:, 3]) / 2
+    bbox_pred_tensor.expand((bounding_box_predictions.size(0), bounding_boxes.size(0), 2))
+
+    bbox_tensor = torch.zeros((bounding_boxes.size(0), 1, 2)) 
+    bbox_tensor[:, 0, 0] = (bounding_boxes[:, 0] + bounding_boxes[:, 2]) / 2
+    bbox_tensor[:, 0, 1] = (bounding_boxes[:, 1] + bounding_boxes[:, 3]) / 2
+    bbox_tensor.expand((bounding_boxes.size(0), bounding_box_predictions.size(0), 2))
+    bbox_tensor = bbox_tensor.flip([0, 1]) 
+
+    #calculate distances element-wise
+    distances = torch.sqrt(torch.square(bbox_pred_tensor[:, :, 0] - bbox_tensor[:, :, 0]) + torch.square(bbox_pred_tensor[:, :, 1] - bbox_tensor[:, :, 1]))
+
+    # get index reordering of prediction bounding boxes based on their closest selecting targer bouding box
+    prediction_ordering = pair_bounding_boxes_by_closeness(distances)
+
+    # reorder prediction bounding boxes and class predictions
+    bounding_box_predictions = bounding_box_predictions[prediction_ordering, :]
+    class_predictions = class_predictions[prediction_ordering, :]
+
+    #if the number of predicted bounding boxes in the image is greater than the maximum allowed number of bouding boxes, give error
+    if MAXIUMUM_BOUDING_BOXES < len(bounding_boxes):
+        print("WARNING the maxiumum number of allowed bounding boxes is less than the amount an image provided")
     
     bounding_box_loss = bounding_box_loss_function(bounding_box_predictions, bounding_boxes)
     classification_loss = classification_loss_function(classification_predictions, classes)
