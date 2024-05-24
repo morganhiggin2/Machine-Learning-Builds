@@ -453,8 +453,11 @@ def pair_bounding_boxes_by_closeness(distances):
     return batch_prediction_ordering
 
 def loss_function(bounding_box_predictions, classification_predictions, bounding_boxes, classes):
-    #TODO what to do if the num of predicted bouding boxes and classes is less than in the image
-    #    assign default error 
+
+    #if the number of predicted bounding boxes in the image is greater than the maximum allowed number of bouding boxes, give error
+    if MAXIUMUM_BOUDING_BOXES < bounding_boxes.size(1):
+        print("WARNING the maxiumum number of allowed bounding boxes is less than the amount an image provided")    #TODO what to do if the num of predicted bouding boxes and classes is less than in the image
+
     if bounding_box_predictions.size(1) > bounding_boxes.size(1):
         over_loss = 0.4 * (bounding_box_predictions.size(1) - bounding_boxes.size(1))
         bounding_box_predictions = bounding_box_predictions[: 0:bounding_boxes.size(1), :]
@@ -494,12 +497,9 @@ def loss_function(bounding_box_predictions, classification_predictions, bounding
     # reorder prediction bounding boxes and class predictions
     print(prediction_ordering)
 
-    bounding_box_predictions = bounding_box_predictions[0: prediction_ordering[0], :]
-    class_predictions = class_predictions[0: prediction_ordering[0], :]
+    bounding_box_predictions = bounding_box_predictions[0, prediction_ordering[0], :].unsqueeze(0)
+    classification_predictions = classification_predictions[0, prediction_ordering[0], :].unsqueeze(0)
 
-    #if the number of predicted bounding boxes in the image is greater than the maximum allowed number of bouding boxes, give error
-    if MAXIUMUM_BOUDING_BOXES < len(bounding_boxes):
-        print("WARNING the maxiumum number of allowed bounding boxes is less than the amount an image provided")
     
     bounding_box_loss = bounding_box_loss_function(bounding_box_predictions, bounding_boxes)
     classification_loss = classification_loss_function(classification_predictions, classes)
